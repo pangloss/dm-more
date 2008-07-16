@@ -4,6 +4,8 @@
 # versioning problems if this gem is updated but "rake install" has not been
 # rerun on the gems it contains.
 
+require 'pathname'
+
 dir = File.join(Pathname(__FILE__).dirname.expand_path, '..')
 
 Dir[File.join(dir, '*')].each do |dm_gem|
