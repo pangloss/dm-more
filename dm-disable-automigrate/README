@@ -1,0 +1,5 @@
+dm-disable-automigrate
+================
+
+Simply prevents any call to auto_migrate from running and wiping the database
+in the process.
