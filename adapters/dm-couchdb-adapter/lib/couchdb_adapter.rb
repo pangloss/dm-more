@@ -50,7 +50,14 @@ module DataMapper
       def create(resources)
         created = 0
         resources.each do |resource|
-          result = http_post("/#{self.escaped_db_name}", resource.to_json(true))
+          key = resource.class.key(self.name).map do |property|
+            resource.instance_variable_get(property.instance_variable_name)
+          end
+          if key.compact.empty?
+            result = http_post("/#{self.escaped_db_name}", resource.to_json(true))
+          else
+            result = http_put("/#{self.escaped_db_name}/#{key}", resource.to_json(true))
+          end
           if result["ok"]
             key = resource.class.key(self.name)
             if key.size == 1
@@ -207,7 +214,7 @@ module DataMapper
           request.body =
 %Q({"map":
   "function(doc) {
-    if (doc.type == '#{query.model.name.downcase}' && #{conditions.join(" && ")}) { 
+    if (doc.type == '#{query.model.name.downcase}' && #{conditions.join(" && ")}) {
       emit(#{key}, doc);
     }
   }"
@@ -225,13 +232,22 @@ module DataMapper
               "#{query_string(query)}"
         request = Net::HTTP::Get.new(uri)
       end
-      
+
       def query_string(query)
         query_string = []
-        query_string << "key=%22#{query.key}%22" if query.key
+        if query.view_options
+          query_string +=
+            query.view_options.map do |key, value|
+              if [:endkey, :key, :startkey].include? key
+                URI.escape(%Q(#{key}=#{value.to_json}))
+              else
+                URI.escape("#{key}=#{value}")
+              end
+            end
+        end
         query_string << "count=#{query.limit}" if query.limit
         query_string << "descending=#{query.add_reversed?}" if query.add_reversed?
-        query_string << "skip=#{query.offset}" if query.offset
+        query_string << "skip=#{query.offset}" if query.offset != 0
         query_string.empty? ? nil : "?#{query_string.join('&')}"
       end
 
