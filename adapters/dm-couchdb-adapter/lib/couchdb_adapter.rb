@@ -1,24 +1,28 @@
 require 'rubygems'
-gem 'dm-core', '=0.9.3'
-require 'base64'
+require 'pathname'
+require Pathname(__FILE__).dirname + 'couchdb_adapter/version'
+gem 'dm-core', DataMapper::More::CouchDBAdapter::VERSION
 require 'dm-core'
 require 'json'
+require 'ostruct'
 require 'net/http'
-require 'pathname'
 require 'uri'
-require Pathname(__FILE__).dirname + 'couchdb_views'
+require Pathname(__FILE__).dirname + 'couchdb_adapter/json_object'
+require Pathname(__FILE__).dirname + 'couchdb_adapter/view'
 
 module DataMapper
   module Resource
     # Converts a Resource to a JSON representation.
     def to_json(dirty = false)
       property_list = self.class.properties.select { |key, value| dirty ? self.dirty_attributes.key?(key) : true }
-      inferred_fields = {:type => self.class.name.downcase}
+      inferred_fields = {:type => self.class.storage_name(repository.name)}
       return (property_list.inject(inferred_fields) do |accumulator, property|
-        accumulator[property.field] = instance_variable_get(property.instance_variable_name)
-        if property.type == Object
-          accumulator[property.field] = Base64.encode64(Marshal.dump(accumulator[property.field]))
-        end
+        accumulator[property.field] =
+          unless property.type.respond_to?(:dump)
+            property.get!(self)
+          else
+            property.type.dump(property.get!(self), property)
+          end
         accumulator
       end).to_json
     end
@@ -28,6 +32,11 @@ end
 module DataMapper
   module Adapters
     class CouchDBAdapter < AbstractAdapter
+      def initialize(name, uri_or_options)
+        super(name, uri_or_options)
+        @resource_naming_convention = NamingConventions::Underscored
+      end
+
       # Returns the name of the CouchDB database.
       #
       # Raises an exception if the CouchDB database name is invalid.
@@ -115,17 +124,31 @@ module DataMapper
           http.request(build_request(query))
         end
         if doc['rows']
-          Collection.new(query) do |collection|
-            doc['rows'].each do |doc|
-              collection.load(
-                query.fields.map do |property|
-                  property.typecast(doc["value"][property.field.to_s])
-                end
-              )
+          if doc['rows'].empty?
+            Collection.new(query) { [] }
+          elsif query.view && query.model.views[query.view.to_sym].has_key?('reduce')
+            doc['rows'].map {|row| OpenStruct.new(row)}
+          else
+            Collection.new(query) do |collection|
+              doc['rows'].each do |doc|
+                data = doc["value"]
+                  collection.load(
+                    query.fields.map do |property|
+                      data[property.field.to_s]
+                    end
+                  )
+              end
             end
           end
-        else
-          []
+        elsif doc['type'] && doc['type'] == query.model.storage_name(repository.name)
+          data = doc
+          Collection.new(query) do |collection|
+            collection.load(
+              query.fields.map do |property|
+                data[property.field.to_s]
+              end
+            )
+          end
         end
       end
 
@@ -133,45 +156,46 @@ module DataMapper
         doc = request do |http|
           http.request(build_request(query))
         end
-        unless doc["rows"].empty?
-          data = doc['rows'].first
+        if doc['rows'] && !doc['rows'].empty?
+          data = doc['rows'].first['value']
+        elsif !doc['rows']
+          data = doc if doc['type'] && doc['type'] == query.model.storage_name(repository.name)
+        end
+        if data
           query.model.load(
             query.fields.map do |property|
-              data["value"][property.field.to_s]
+              data[property.field.to_s]
             end,
-            query)
+            query
+          )
         end
       end
 
     protected
-      # Converts the URI's scheme into a parsed HTTP identifier.
-      def normalize_uri(uri_or_options)
-        if String === uri_or_options
-          uri_or_options = Addressable::URI.parse(uri_or_options)
+      def build_request(query)
+        if query.view
+          view_request(query)
+        elsif query.conditions.length == 1 &&
+              query.conditions.first[0] == :eql &&
+              query.conditions.first[1].key?
+          get_request(query)
+        else
+          ad_hoc_request(query)
         end
-        if Addressable::URI === uri_or_options
-          return uri_or_options.normalize
-        end
-
-        user = uri_or_options.delete(:username)
-        password = uri_or_options.delete(:password)
-        host = (uri_or_options.delete(:host) || "")
-        port = uri_or_options.delete(:port)
-        database = uri_or_options.delete(:database)
-        query = uri_or_options.to_a.map { |pair| pair.join('=') }.join('&')
-        query = nil if query == ""
-
-        return Addressable::URI.new(
-          "http", user, password, host, port, database, query, nil
-        )
       end
 
-      def build_request(query)
-        unless query.view
-          ad_hoc_request(query)
-        else
-          view_request(query)
-        end
+      def view_request(query)
+        uri = "/#{self.escaped_db_name}/" +
+              "_view/" +
+              "#{query.model.storage_name(self.name)}/" +
+              "#{query.view}" +
+              "#{query_string(query)}"
+        request = Net::HTTP::Get.new(uri)
+      end
+
+      def get_request(query)
+        uri = "/#{self.escaped_db_name}/#{query.conditions.first[2]}"
+        request = Net::HTTP::Get.new(uri)
       end
 
       def ad_hoc_request(query)
@@ -191,7 +215,7 @@ module DataMapper
           request.body =
 %Q({"map":
   "function(doc) {
-  if (doc.type == '#{query.model.name.downcase}') {
+  if (doc.type == '#{query.model.storage_name(repository.name)}') {
     emit(#{key}, doc);
     }
   }"
@@ -199,22 +223,29 @@ module DataMapper
 )
         else
           conditions = query.conditions.map do |operator, property, value|
-            json_value = value.to_json.gsub("\"", "'")
-            condition = "doc.#{property.field}"
-            condition << case operator
-            when :eql   then " == #{json_value}"
-            when :not   then " != #{json_value}"
-            when :gt    then " > #{json_value}"
-            when :gte   then " >= #{json_value}"
-            when :lt    then " < #{json_value}"
-            when :lte   then " <= #{json_value}"
-            when :like  then like_operator(value)
+            if operator == :eql && value.is_a?(Array)
+              value.map do |sub_value|
+                json_sub_value = sub_value.to_json.gsub("\"", "'")
+                "doc.#{property.field} == #{json_sub_value}"
+              end.join(" || ")
+            else
+              json_value = value.to_json.gsub("\"", "'")
+              condition = "doc.#{property.field}"
+              condition << case operator
+              when :eql   then " == #{json_value}"
+              when :not   then " != #{json_value}"
+              when :gt    then " > #{json_value}"
+              when :gte   then " >= #{json_value}"
+              when :lt    then " < #{json_value}"
+              when :lte   then " <= #{json_value}"
+              when :like  then like_operator(value)
+              end
             end
           end
           request.body =
 %Q({"map":
   "function(doc) {
-    if (doc.type == '#{query.model.name.downcase}' && #{conditions.join(" && ")}) {
+    if (doc.type == '#{query.model.storage_name(repository.name)}' && #{conditions.join(" && ")}) {
       emit(#{key}, doc);
     }
   }"
@@ -222,15 +253,6 @@ module DataMapper
 )
         end
         request
-      end
-
-      def view_request(query)
-        uri = "/#{self.escaped_db_name}/" +
-              "_view/" +
-              "#{query.model.storage_name(self.name)}/" +
-              "#{query.view}" +
-              "#{query_string(query)}"
-        request = Net::HTTP::Get.new(uri)
       end
 
       def query_string(query)
